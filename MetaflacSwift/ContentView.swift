@@ -16,15 +16,19 @@ struct ImageInfo {
     var height: Int
     var colorDepth: Int
     var dataLength: Int
+    var imageData: Data
 }
 
 struct ContentView: View {
     @State private var isPresented = false
+    @State private var flacUrl: URL? = nil
     @State private var importResult = ""
     
     @State private var isImagePickerPresented = false
     @State private var imageInfo: ImageInfo?
     @State private var errorMessage: String?
+    
+    @State private var document: FileDocument? = nil
     
     var body: some View {
         HStack {
@@ -35,6 +39,7 @@ struct ContentView: View {
                 .fileImporter(isPresented: $isPresented, allowedContentTypes: [.audio]) { result in
                     switch result {
                     case .success(let url):
+                        flacUrl = url
                         importResult = url.path(percentEncoded: false)
                         readMetadata(url)
                     case .failure(let error):
@@ -70,6 +75,13 @@ struct ContentView: View {
                     Text("Color Depth: \(imageInfo.colorDepth) bpp")
                     Text("Data Length: \(imageInfo.dataLength) bytes")
                 }
+                
+                Button("Export with PICTURE Block") {
+                    if let url = flacUrl, let imageInfo = imageInfo {
+                        exportWithPictureBlock(flacURL: url, imageInfo: imageInfo)
+                    }
+                }
+                
                 Spacer()
             }
             .padding()
@@ -130,24 +142,104 @@ struct ContentView: View {
                 }
             }
             
-            url.stopAccessingSecurityScopedResource()
+//            url.stopAccessingSecurityScopedResource()
         } catch {
             print("Failed to read data from file: \(error.localizedDescription)")
         }
     }
     
-    func fetchImageInfo(from url: URL) -> ImageInfo {
+    func fetchImageInfo(from url: URL) -> ImageInfo? {
         let _ = url.startAccessingSecurityScopedResource()
-        guard let nsImage = NSImage(contentsOf: url) else {
-            return ImageInfo(filePath: url.path, mimeType: "Unknown", width: 0, height: 0, colorDepth: 0, dataLength: 0)
+        guard let nsImage = NSImage(contentsOf: url),
+              let imageData = try? Data(contentsOf: url) else {
+            return nil
         }
+        
         let width = Int(nsImage.size.width)
         let height = Int(nsImage.size.height)
         let colorDepth = nsImage.representations.first?.bitsPerSample ?? 8
-        let dataLength = (try? Data(contentsOf: url).count) ?? 0
+        let dataLength = imageData.count
         let mimeType = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "Unknown"
         
-        return ImageInfo(filePath: url.path, mimeType: mimeType, width: width, height: height, colorDepth: colorDepth, dataLength: dataLength)
+        return ImageInfo(filePath: url.path, mimeType: mimeType, width: width, height: height, colorDepth: colorDepth, dataLength: dataLength, imageData: imageData)
+    }
+    
+    private func exportWithPictureBlock(flacURL: URL, imageInfo: ImageInfo) {
+        do {
+            let buffer = try Data(contentsOf: flacURL)
+            
+            // Locate last-metadata-block and prepare new data with PICTURE block
+            var modifiedData = Data()
+            var offset = 4
+            var isLastBlock = false
+            
+            modifiedData.append(buffer[..<offset]) // Append FLAC header
+            
+            while !isLastBlock && offset + 4 <= buffer.count {
+                let metadataHeader = buffer[offset]
+                isLastBlock = (metadataHeader & 0x80) != 0
+                
+                let blockType = metadataHeader & 0x7F
+                let length = (Int(buffer[offset + 1]) << 16) | (Int(buffer[offset + 2]) << 8) | Int(buffer[offset + 3])
+                
+                if isLastBlock {
+                    // Insert PICTURE block before last-metadata-block
+                    modifiedData.append(createPictureBlock(from: imageInfo))
+                }
+                
+                // Append the current metadata block
+                modifiedData.append(buffer[offset..<offset + 4 + length])
+                offset += 4 + length
+            }
+            
+            // Write to a new file with the PICTURE block inserted
+            let outputURL = flacURL.deletingLastPathComponent().appendingPathComponent("ModifiedWithPicture.flac")
+            try modifiedData.write(to: outputURL)
+            print("File exported successfully at \(outputURL.path)")
+            
+        } catch {
+            print("Failed to export with PICTURE block: \(error.localizedDescription)")
+        }
+    }
+    
+    private func createPictureBlock(from imageInfo: ImageInfo) -> Data {
+        var pictureBlock = Data()
+        
+        // Set last-metadata-block flag to 0, block type to 6 (PICTURE)
+        pictureBlock.append(0x06)
+        
+        // Prepare picture metadata block
+        let mimeTypeData = Data(imageInfo.mimeType.utf8)
+        let descriptionData = Data("Cover Image".utf8)
+        
+        // Calculate length and add it in 3 bytes
+        let length = 32 + 4 + mimeTypeData.count + 4 + descriptionData.count + 4 + 4 + 4 + 4 + 4 + imageInfo.dataLength
+        pictureBlock.append(contentsOf: withUnsafeBytes(of: length.bigEndian) { Array($0).suffix(3) })
+        
+        // Add picture type (cover front = 3)
+        pictureBlock.append(contentsOf: [0, 0, 0, 3])
+        
+        // Add MIME type length and data
+        pictureBlock.append(contentsOf: withUnsafeBytes(of: UInt32(mimeTypeData.count).bigEndian) { Array($0) })
+        pictureBlock.append(mimeTypeData)
+        
+        // Add description length and data
+        pictureBlock.append(contentsOf: withUnsafeBytes(of: UInt32(descriptionData.count).bigEndian) { Array($0) })
+        pictureBlock.append(descriptionData)
+        
+        // Add picture dimensions (width, height, color depth, and reserved)
+        pictureBlock.append(contentsOf: [
+            UInt32(imageInfo.width).bigEndian,
+            UInt32(imageInfo.height).bigEndian,
+            UInt32(imageInfo.colorDepth).bigEndian,
+            0 // Reserved for non-indexed pictures
+        ].flatMap { withUnsafeBytes(of: $0) { Array($0) } })
+        
+        // Add image data length and data
+        pictureBlock.append(contentsOf: withUnsafeBytes(of: UInt32(imageInfo.dataLength).bigEndian) { Array($0) })
+        pictureBlock.append(imageInfo.imageData)
+        
+        return pictureBlock
     }
 }
 
