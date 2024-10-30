@@ -6,10 +6,25 @@
 //
 
 import SwiftUI
+import UniformTypeIdentifiers
+
+// Struct to store image information
+struct ImageInfo {
+    var filePath: String
+    var mimeType: String
+    var width: Int
+    var height: Int
+    var colorDepth: Int
+    var dataLength: Int
+}
 
 struct ContentView: View {
     @State private var isPresented = false
     @State private var importResult = ""
+    
+    @State private var isImagePickerPresented = false
+    @State private var imageInfo: ImageInfo?
+    @State private var errorMessage: String?
     
     var body: some View {
         HStack {
@@ -27,6 +42,34 @@ struct ContentView: View {
                     }
                 }
                 Text(importResult)
+                
+                Button("Select Image File") {
+                    isImagePickerPresented = true
+                }
+                .fileImporter(isPresented: $isImagePickerPresented, allowedContentTypes: [.image]) { result in
+                    switch result {
+                    case .success(let url):
+                        imageInfo = fetchImageInfo(from: url)
+                        errorMessage = nil // Clear any previous error
+                    case .failure(let error):
+                        errorMessage = "Error: \(error.localizedDescription)"
+                        imageInfo = nil // Clear any previous image info
+                    }
+                }
+                
+                if let errorMessage = errorMessage {
+                    Text(errorMessage)
+                        .foregroundColor(.red)
+                }
+                
+                if let imageInfo = imageInfo {
+                    Text("File Path: \(imageInfo.filePath)")
+                    Text("MIME Type: \(imageInfo.mimeType)")
+                    Text("Width: \(imageInfo.width) px")
+                    Text("Height: \(imageInfo.height) px")
+                    Text("Color Depth: \(imageInfo.colorDepth) bpp")
+                    Text("Data Length: \(imageInfo.dataLength) bytes")
+                }
                 Spacer()
             }
             .padding()
@@ -91,6 +134,20 @@ struct ContentView: View {
         } catch {
             print("Failed to read data from file: \(error.localizedDescription)")
         }
+    }
+    
+    func fetchImageInfo(from url: URL) -> ImageInfo {
+        let _ = url.startAccessingSecurityScopedResource()
+        guard let nsImage = NSImage(contentsOf: url) else {
+            return ImageInfo(filePath: url.path, mimeType: "Unknown", width: 0, height: 0, colorDepth: 0, dataLength: 0)
+        }
+        let width = Int(nsImage.size.width)
+        let height = Int(nsImage.size.height)
+        let colorDepth = nsImage.representations.first?.bitsPerSample ?? 8
+        let dataLength = (try? Data(contentsOf: url).count) ?? 0
+        let mimeType = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "Unknown"
+        
+        return ImageInfo(filePath: url.path, mimeType: mimeType, width: width, height: height, colorDepth: colorDepth, dataLength: dataLength)
     }
 }
 
