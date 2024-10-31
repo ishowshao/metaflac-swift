@@ -108,6 +108,7 @@ struct ContentView: View {
             // Start reading blocks after the initial four-byte FLAC marker
             var offset = 4
             var isLastBlock = false
+            var hasPictureBlock = false
             
             while !isLastBlock && offset + 4 <= buffer.count {
                 // Read METADATA_BLOCK_HEADER
@@ -116,6 +117,10 @@ struct ContentView: View {
                 // Extract the last-metadata-block flag and block type
                 isLastBlock = (metadataHeader & 0x80) != 0 // 0x80 = 0b10000000
                 let blockType = metadataHeader & 0x7F       // 0x7F = 0b01111111
+                
+                if blockType == 6 {
+                    hasPictureBlock = true
+                }
                 
                 // Read the next 3 bytes for the length
                 guard offset + 4 <= buffer.count else {
@@ -141,6 +146,12 @@ struct ContentView: View {
                 }
             }
             
+            if hasPictureBlock {
+                print("Has picture block.")
+            } else {
+                print("No picture block.")
+            }
+            
         } catch {
             print("Failed to read data from file: \(error.localizedDescription)")
         }
@@ -164,29 +175,41 @@ struct ContentView: View {
     private func exportWithPictureBlock(flacURL: URL, imageInfo: ImageInfo) {
         do {
             let buffer = try Data(contentsOf: flacURL)
+            print("Buffer count: \(buffer.count)")
             
             // Locate last-metadata-block and prepare new data with PICTURE block
             var modifiedData = Data()
             var offset = 4
+            
             var isLastBlock = false
             
             modifiedData.append(buffer[..<offset]) // Append FLAC header
             
-            while !isLastBlock && offset + 4 <= buffer.count {
-                let metadataHeader = buffer[offset]
-                isLastBlock = (metadataHeader & 0x80) != 0
-                
-                let blockType = metadataHeader & 0x7F
-                let length = (Int(buffer[offset + 1]) << 16) | (Int(buffer[offset + 2]) << 8) | Int(buffer[offset + 3])
-                
-                if isLastBlock {
-                    // Insert PICTURE block before last-metadata-block
-                    modifiedData.append(createPictureBlock(from: imageInfo))
-                }
-                
-                // Append the current metadata block
-                modifiedData.append(buffer[offset..<offset + 4 + length])
-                offset += 4 + length
+            let metadataHeader = buffer[offset]
+            
+            // Extract the last-metadata-block flag and block type
+            isLastBlock = (metadataHeader & 0x80) != 0 // 0x80 = 0b10000000
+            let blockType = metadataHeader & 0x7F       // 0x7F = 0b01111111
+            let length = (Int(buffer[offset + 1]) << 16) | (Int(buffer[offset + 2]) << 8) | Int(buffer[offset + 3])
+            
+            // Append the current metadata block
+            print("Append first block \(offset) to \(offset + 4 + length)")
+            modifiedData.append(buffer[offset..<offset + 4 + length])
+            offset += 4 + length
+            print("Current offset: \(offset)")
+            
+            // Insert PICTURE block
+            if let pictureBlock = createPictureBlock(from: imageInfo) {
+                modifiedData.append(pictureBlock)
+                print("Picture block count: \(pictureBlock.count)")
+            } else {
+                print("Create picture block failed")
+            }
+            
+            // Append the remaining buffer content (audio data and other metadata)
+            if offset < buffer.count {
+                modifiedData.append(buffer[offset...])
+                print("Output count: \(modifiedData.count)")
             }
             
             // Write to a new file with the PICTURE block inserted
@@ -199,44 +222,76 @@ struct ContentView: View {
         }
     }
     
-    private func createPictureBlock(from imageInfo: ImageInfo) -> Data {
-        var pictureBlock = Data()
+    private func createPictureMetadataBlockHeader(length: Int) -> Data? {
+        // 检查传入的长度是否在有效范围内 (0 到 16,777,215，24 位的最大值)
+        guard length >= 0 && length <= 0xFFFFFF else {
+            print("Length out of valid range")
+            return nil
+        }
+
+        // 构建 METADATA_BLOCK_HEADER 的字节数组
+        var header = Data()
         
-        // Set last-metadata-block flag to 0, block type to 6 (PICTURE)
-        pictureBlock.append(0x06)
+        // 1bit 的 Last-metadata-block flag (假设此处为 0 表示还有更多元数据块)
+        let lastMetadataBlockFlag: UInt8 = 0 << 7
+        
+        // 7bits 的 BLOCK_TYPE，类型为 6 表示 PICTURE
+        let blockType: UInt8 = 6
+        
+        // 组合 Last-metadata-block flag 和 BLOCK_TYPE
+        let firstByte: UInt8 = lastMetadataBlockFlag | blockType
+        header.append(firstByte)
+        
+        // 将长度分成三个字节 (24 bits)，并依次加入 header
+        header.append(UInt8((length >> 16) & 0xFF))
+        header.append(UInt8((length >> 8) & 0xFF))
+        header.append(UInt8(length & 0xFF))
+        
+        return header
+    }
+    
+    private func createPictureBlock(from imageInfo: ImageInfo) -> Data? {
+        var pictureBlock = Data()
         
         // Prepare picture metadata block
         let mimeTypeData = Data(imageInfo.mimeType.utf8)
         let descriptionData = Data("Cover Image".utf8)
         
         // Calculate length and add it in 3 bytes
-        let length = 32 + 4 + mimeTypeData.count + 4 + descriptionData.count + 4 + 4 + 4 + 4 + 4 + imageInfo.dataLength
-        pictureBlock.append(contentsOf: withUnsafeBytes(of: length.bigEndian) { Array($0).suffix(3) })
+        let length = 4 + 4 + mimeTypeData.count + 4 + descriptionData.count + 4 + 4 + 4 + 4 + 4 + imageInfo.dataLength
         
-        // Add picture type (cover front = 3)
-        pictureBlock.append(contentsOf: [0, 0, 0, 3])
+        if let header = createPictureMetadataBlockHeader(length: length) {
+            pictureBlock.append(header)
+            
+//            pictureBlock.append(contentsOf: withUnsafeBytes(of: length.bigEndian) { Array($0).suffix(3) })
+            
+            // Add picture type (cover front = 3)
+            pictureBlock.append(contentsOf: [0, 0, 0, 3])
+            
+            // Add MIME type length and data
+            pictureBlock.append(contentsOf: withUnsafeBytes(of: UInt32(mimeTypeData.count).bigEndian) { Array($0) })
+            pictureBlock.append(mimeTypeData)
+            
+            // Add description length and data
+            pictureBlock.append(contentsOf: withUnsafeBytes(of: UInt32(descriptionData.count).bigEndian) { Array($0) })
+            pictureBlock.append(descriptionData)
+            
+            // Add picture dimensions (width, height, color depth, and reserved)
+            pictureBlock.append(contentsOf: [
+                UInt32(imageInfo.width).bigEndian,
+                UInt32(imageInfo.height).bigEndian,
+                UInt32(imageInfo.colorDepth).bigEndian,
+                0 // Reserved for non-indexed pictures
+            ].flatMap { withUnsafeBytes(of: $0) { Array($0) } })
+            
+            // Add image data length and data
+            pictureBlock.append(contentsOf: withUnsafeBytes(of: UInt32(imageInfo.dataLength).bigEndian) { Array($0) })
+            pictureBlock.append(imageInfo.imageData)
+            
+            return pictureBlock
+        }
         
-        // Add MIME type length and data
-        pictureBlock.append(contentsOf: withUnsafeBytes(of: UInt32(mimeTypeData.count).bigEndian) { Array($0) })
-        pictureBlock.append(mimeTypeData)
-        
-        // Add description length and data
-        pictureBlock.append(contentsOf: withUnsafeBytes(of: UInt32(descriptionData.count).bigEndian) { Array($0) })
-        pictureBlock.append(descriptionData)
-        
-        // Add picture dimensions (width, height, color depth, and reserved)
-        pictureBlock.append(contentsOf: [
-            UInt32(imageInfo.width).bigEndian,
-            UInt32(imageInfo.height).bigEndian,
-            UInt32(imageInfo.colorDepth).bigEndian,
-            0 // Reserved for non-indexed pictures
-        ].flatMap { withUnsafeBytes(of: $0) { Array($0) } })
-        
-        // Add image data length and data
-        pictureBlock.append(contentsOf: withUnsafeBytes(of: UInt32(imageInfo.dataLength).bigEndian) { Array($0) })
-        pictureBlock.append(imageInfo.imageData)
-        
-        return pictureBlock
+        return nil
     }
 }
 
