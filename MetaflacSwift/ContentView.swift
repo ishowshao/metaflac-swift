@@ -91,7 +91,6 @@ struct ContentView: View {
     
     private func readMetadata(_ url: URL) {
         do {
-            let _ = url.startAccessingSecurityScopedResource()
             let buffer = try Data(contentsOf: url)
             
             // Verify the first four bytes
@@ -142,14 +141,12 @@ struct ContentView: View {
                 }
             }
             
-//            url.stopAccessingSecurityScopedResource()
         } catch {
             print("Failed to read data from file: \(error.localizedDescription)")
         }
     }
     
     func fetchImageInfo(from url: URL) -> ImageInfo? {
-        let _ = url.startAccessingSecurityScopedResource()
         guard let nsImage = NSImage(contentsOf: url),
               let imageData = try? Data(contentsOf: url) else {
             return nil
